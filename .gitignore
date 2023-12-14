@@ -82,6 +82,7 @@ celerybeat-schedule
 venv/
 ENV/
 nnunet_test2/
+my_nnunet/
 # Spyder project settings
 .spyderproject
 
