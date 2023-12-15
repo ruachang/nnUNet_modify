@@ -7,13 +7,13 @@ import torch
 import numpy as np
 # from nnformer.network_architecture.initialization import InitWeights_He
 from nnunetv2.training.nnUNetTrainer.variants.network_architecture.neural_network import SegmentationNetwork
+from nnunetv2.utilities.axial import AxialAttention
 import torch.nn.functional
 
 
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_3tuple, trunc_normal_
-from axial_attention import AxialAttention, AxialImageTransformer, SelfAttention
 class ContiguousGrad(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
@@ -690,7 +690,7 @@ class AxialAttentionBlock(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.window_size = to_3tuple(min(self.input_resolution))
 
-        self.norm1 = norm_layer(dim)
+        # self.norm1 = norm_layer(dim)
         
         self.attn = AxialAttention(
             dim, heads=num_heads, dim_index=4, num_dimensions=3, sum_axial_out=True)
@@ -699,29 +699,29 @@ class AxialAttentionBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1) * (2 * window_size[2] - 1),
-                        num_heads)) 
+        self.proj_drop = nn.Dropout(drop)
+        # self.relative_position_bias_table = nn.Parameter(
+        #     torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1) * (2 * window_size[2] - 1),
+        #                 num_heads)) 
 
-        # get pair-wise relative position index for each token inside the window
-        coords_s = torch.arange(self.window_size[0])
-        coords_h = torch.arange(self.window_size[1])
-        coords_w = torch.arange(self.window_size[2])
-        coords = torch.stack(torch.meshgrid([coords_s, coords_h, coords_w]))  
-        coords_flatten = torch.flatten(coords, 1)  
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous() 
-        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 2] += self.window_size[2] - 1
+        # # get pair-wise relative position index for each token inside the window
+        # coords_s = torch.arange(self.window_size[0])
+        # coords_h = torch.arange(self.window_size[1])
+        # coords_w = torch.arange(self.window_size[2])
+        # coords = torch.stack(torch.meshgrid([coords_s, coords_h, coords_w]))  
+        # coords_flatten = torch.flatten(coords, 1)  
+        # relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  
+        # relative_coords = relative_coords.permute(1, 2, 0).contiguous() 
+        # relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        # relative_coords[:, :, 1] += self.window_size[1] - 1
+        # relative_coords[:, :, 2] += self.window_size[2] - 1
 
-        relative_coords[:, :, 0] *= 3 * self.window_size[1] - 1
-        relative_coords[:, :, 1] *= 2 * self.window_size[1] - 1
+        # relative_coords[:, :, 0] *= 3 * self.window_size[1] - 1
+        # relative_coords[:, :, 1] *= 2 * self.window_size[1] - 1
 
-        relative_position_index = relative_coords.sum(-1) 
-        self.register_buffer("relative_position_index", relative_position_index)
-        trunc_normal_(self.relative_position_bias_table, std=.02)
+        # relative_position_index = relative_coords.sum(-1) 
+        # self.register_buffer("relative_position_index", relative_position_index)
+        # trunc_normal_(self.relative_position_bias_table, std=.02)
 
     def forward(self, x):
 
@@ -731,16 +731,16 @@ class AxialAttentionBlock(nn.Module):
         assert L == S * H * W, "input feature has wrong size"
         
         shortcut = x
-        x = self.norm1(x)
+        # x = self.norm1(x)
         x = x.view(B, S, H, W, C)
         # partition windows
         attn = self.attn(x).view(B, S * H * W, C)
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1] * self.window_size[2],
-            self.window_size[0] * self.window_size[1] * self.window_size[2], -1)  
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
-        attn = attn + relative_position_bias.unsqueeze(0)
-        
+        # relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+        #     self.window_size[0] * self.window_size[1] * self.window_size[2],
+        #     self.window_size[0] * self.window_size[1] * self.window_size[2], -1)  
+        # relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
+        # attn = attn + relative_position_bias.unsqueeze(0)
+        attn = self.proj_drop(attn)
         # FFN
         x = shortcut + self.drop_path(attn)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -800,25 +800,18 @@ class AxialAttentionBlock_kv(nn.Module):
         self.dim = dim
         self.input_resolution = input_resolution
         self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
    
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
-
-        self.norm1 = norm_layer(dim)
-        
         self.attn = AxialAttention(
-            dim, heads=num_heads, dim_index=4, num_dimensions=3, sum_axial_out=True)
-       
+            dim, heads=num_heads, dim_index=-1, num_dimensions=3, sum_axial_out=True)
+        self.proj_drop = nn.Dropout(drop)
+        # self.norm1 = norm_layer(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        
-        self.kv = nn.Linear(dim, dim * 2)
        
-    def forward(self, skip, x):
+    def forward(self, x, skip=None,x_up=None):
 
         B, L, C = x.shape
         S, H, W = self.input_resolution
@@ -826,15 +819,30 @@ class AxialAttentionBlock_kv(nn.Module):
         assert L == S * H * W, "input feature has wrong size"
         
         shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, S, H, W, C)
-        # partition windows
-        attn = self.attn(x).view(B, S * H * W, C)
-
-        # FFN
-        x = shortcut + self.drop_path(attn)
+        #skip = self.norm1(skip)
+        #x_up = self.norm1(x_up)
+        #print(skip.shape, x_up.shape)
+        #skip = skip.view(B, S, H, W, C)
+        #x_up = x_up.view(B, S, H, W, C)
+        
+        B, L, C = skip.shape
+        
+        kv = skip
+        q = x_up
+        print(kv.shape, q.shape)
+        #kv=kv.reshape(B, L, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        # q = q.reshape(B,L,self.num_heads,C//self.num_heads).permute(0,2,1,3).contiguous()
+        # kv = kv.reshape(B,L,self.num_heads,C//self.num_heads).permute(0,2,1,3).contiguous()
+        q = q.view(B, S, H, W, C)
+        kv = kv.view(B, S, H, W, C)
+        #print(kv.shape, q.shape)
+        att = self.attn(q,kv)
+        att = self.proj_drop(att)
+        x = att.view(B, S * H * W, C)
+        print(x.shape)
+        x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-
+        print(x.shape)
         return x
 
 class BottleBasicLayer_up(nn.Module):
@@ -856,30 +864,22 @@ class BottleBasicLayer_up(nn.Module):
         # build blocks
         self.blocks = nn.ModuleList()
         self.blocks.append(
-            SwinTransformerBlock_kv(
+            AxialAttentionBlock_kv(
                     dim=dim,
                     input_resolution=input_resolution,
                     num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=0 ,
                     mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
                     drop=drop,
                     attn_drop=attn_drop,
                     drop_path=drop_path[0] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer)
                     )
         for i in range(depth-1):
             self.blocks.append(
-                SwinTransformerBlock(
+                AxialAttentionBlock(
                         dim=dim,
                         input_resolution=input_resolution,
                         num_heads=num_heads,
-                        window_size=window_size,
-                        shift_size=window_size // 2 ,
                         mlp_ratio=mlp_ratio,
-                        qkv_bias=qkv_bias,
-                        qk_scale=qk_scale,
                         drop=drop,
                         attn_drop=attn_drop,
                         drop_path=drop_path[i+1] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer)
@@ -888,41 +888,14 @@ class BottleBasicLayer_up(nn.Module):
         self.Upsample = upsample(dim=2*dim, norm_layer=norm_layer)
     def forward(self, x,skip, S, H, W):
         
-      
         x_up = self.Upsample(x, S, H, W)
        
         x = x_up + skip
         S, H, W = S * 2, H * 2, W * 2
-        # calculate attention mask for SW-MSA
-        Sp = int(np.ceil(S / self.window_size)) * self.window_size
-        Hp = int(np.ceil(H / self.window_size)) * self.window_size
-        Wp = int(np.ceil(W / self.window_size)) * self.window_size
-        img_mask = torch.zeros((1, Sp, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
-        s_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        h_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        w_slices = (slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None))
-        cnt = 0
-        for s in s_slices:
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, s, h, w, :] = cnt
-                    cnt += 1
-
-        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-        mask_windows = mask_windows.view(-1,
-                                         self.window_size * self.window_size * self.window_size)  # 3d��3��winds�˻�����Ŀ�Ǻܴ�ģ�����winds����̫��
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         
-        x = self.blocks[0](x, attn_mask,skip=skip,x_up=x_up)
+        x = self.blocks[0](x, skip=skip,x_up=x_up)
         for i in range(self.depth-1):
-            x = self.blocks[i+1](x,attn_mask)
+            x = self.blocks[i+1](x)
         
         return x, S, H, W
         
@@ -993,17 +966,14 @@ class Bottleneck(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(ori_depths[1:]))]  # stochastic depth decay rule
 
         # build layers
-        layer = BasicLayer_up(
+        layer = BottleBasicLayer_up(
             dim=int(embed_dim * 2 ** (len(ori_depths) - 2)),
             input_resolution=(
                 pretrain_img_size[0] // patch_size[0] // 2 ** (len(ori_depths)-2), pretrain_img_size[1] // patch_size[1] // 2 ** (len(ori_depths)-2),
                 pretrain_img_size[2] // patch_size[2] // 2 ** (len(ori_depths)-2)),
             depth=depths[0],
             num_heads=num_heads[1],
-            window_size=window_size[0],
             mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             drop=drop_rate,
             attn_drop=attn_drop_rate,
             drop_path=dpr[sum(
@@ -1036,7 +1006,6 @@ class Bottleneck(nn.Module):
         neck, S, H, W, = self.layers[2](neck, skips, S, H, W)
         out = neck.view(-1, S, H, W, self.decoder_num_features[0])
         return out, neck, S, H, W
-
 class Encoder(nn.Module):
    
     def __init__(self,
@@ -1136,7 +1105,6 @@ class Encoder(nn.Module):
             if i == self.num_layers - 1:
                 down.append(x)
         return down, Ws, Wh, Ww
-    
 class Decoder(nn.Module):
     def __init__(self,
                  pretrain_img_size,
@@ -1201,9 +1169,7 @@ class Decoder(nn.Module):
             x, S, H, W,  = layer(x,skips[i], S, H, W)
             out = x.view(-1, S, H, W, self.num_features[i])
             outs.append(out)
-        return outs
-
-      
+        return outs     
 class final_patch_expanding(nn.Module):
     # expand output of each split and merge them together
     # input: list of all groups output at the layer
