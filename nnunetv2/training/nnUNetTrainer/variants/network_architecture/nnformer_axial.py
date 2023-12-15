@@ -14,7 +14,13 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_3tuple, trunc_normal_
 from axial_attention import AxialAttention, AxialImageTransformer, SelfAttention
-
+class ContiguousGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return x
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out.contiguous()
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
 
@@ -34,7 +40,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
 def window_partition(x, window_size):
   
     B, S, H, W, C = x.shape
@@ -47,6 +52,99 @@ def window_reverse(windows, window_size, S, H, W):
     x = windows.view(B, S // window_size, H // window_size, W // window_size, window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, S, H, W, -1)
     return x
+class SwinTransformerBlock_kv(nn.Module):
+
+
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        if min(self.input_resolution) <= self.window_size:
+            # if window size is larger than input resolution, we don't partition windows
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention_kv(
+                dim, window_size=to_3tuple(self.window_size), num_heads=num_heads,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        
+        #self.window_size=to_3tuple(self.window_size)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+       
+    def forward(self, x, mask_matrix,skip=None,x_up=None):
+    
+        B, L, C = x.shape
+        S, H, W = self.input_resolution
+ 
+        assert L == S * H * W, "input feature has wrong size"
+        
+        shortcut = x
+        skip = self.norm1(skip)
+        x_up = self.norm1(x_up)
+
+        skip = skip.view(B, S, H, W, C)
+        x_up = x_up.view(B, S, H, W, C)
+        x = x.view(B, S, H, W, C)
+        # pad feature maps to multiples of window size
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        pad_g = (self.window_size - S % self.window_size) % self.window_size
+
+        skip = F.pad(skip, (0, 0, 0, pad_r, 0, pad_b, 0, pad_g))  
+        x_up = F.pad(x_up, (0, 0, 0, pad_r, 0, pad_b, 0, pad_g))  
+        _, Sp, Hp, Wp, _ = skip.shape
+
+       
+        
+        # cyclic shift
+        if self.shift_size > 0:
+            skip = torch.roll(skip, shifts=(-self.shift_size, -self.shift_size,-self.shift_size), dims=(1, 2,3))
+            x_up = torch.roll(x_up, shifts=(-self.shift_size, -self.shift_size,-self.shift_size), dims=(1, 2,3))
+            attn_mask = mask_matrix
+        else:
+            skip = skip
+            x_up=x_up
+            attn_mask = None
+        # partition windows
+        skip = window_partition(skip, self.window_size) 
+        skip = skip.view(-1, self.window_size * self.window_size * self.window_size,
+                                   C)  
+        x_up = window_partition(x_up, self.window_size) 
+        x_up = x_up.view(-1, self.window_size * self.window_size * self.window_size,
+                                   C)  
+        attn_windows=self.attn(skip,x_up,mask=attn_mask,pos_embed=None)
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Sp, Hp, Wp)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size, self.shift_size), dims=(1, 2, 3))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b > 0 or pad_g > 0:
+            x = x[:, :S, :H, :W, :].contiguous()
+
+        x = x.view(B, S * H * W, C)
+
+        # FFN
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
 class WindowAttention_kv(nn.Module):
    
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -335,6 +433,88 @@ class Patch_Expanding(nn.Module):
         x=x.permute(0,2,3,4,1).contiguous().view(B,-1,C//2)
        
         return x
+class BasicLayer(nn.Module):
+   
+    def __init__(self,
+                 dim,
+                 input_resolution,
+                 depth,
+                 num_heads,
+                 window_size=7,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 norm_layer=nn.LayerNorm,
+                 downsample=True
+                 ):
+        super().__init__()
+        self.window_size = window_size
+        self.shift_size = window_size // 2
+        self.depth = depth
+        # build blocks
+        
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(
+                dim=dim,
+                input_resolution=input_resolution,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop,
+                attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, norm_layer=norm_layer)
+            for i in range(depth)])
+
+        # patch merging layer
+        if downsample is not None:
+            self.downsample = downsample(dim=dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
+
+    def forward(self, x, S, H, W):
+      
+
+        # calculate attention mask for SW-MSA
+        Sp = int(np.ceil(S / self.window_size)) * self.window_size
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        img_mask = torch.zeros((1, Sp, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+        s_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for s in s_slices:
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, s, h, w, :] = cnt
+                    cnt += 1
+
+        mask_windows = window_partition(img_mask, self.window_size)  
+        mask_windows = mask_windows.view(-1,
+                                         self.window_size * self.window_size * self.window_size)  
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        for blk in self.blocks:
+          
+            x = blk(x, attn_mask)
+        if self.downsample is not None:
+            x_down = self.downsample(x, S, H, W)
+            Ws, Wh, Ww = (S + 1) // 2, (H + 1) // 2, (W + 1) // 2
+            return x, S, H, W, x_down, Ws, Wh, Ww
+        else:
+            return x, S, H, W, x, S, H, W
 class BasicLayer_up(nn.Module):
 
     def __init__(self,
@@ -857,19 +1037,323 @@ class Bottleneck(nn.Module):
         out = neck.view(-1, S, H, W, self.decoder_num_features[0])
         return out, neck, S, H, W
 
+class Encoder(nn.Module):
+   
+    def __init__(self,
+                 pretrain_img_size=224,
+                 patch_size=4,
+                 in_chans=1  ,
+                 embed_dim=96,
+                 depths=[2, 2, 2, 2],
+                 num_heads=[4, 8, 16, 32],
+                 window_size=7,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_rate=0.,
+                 attn_drop_rate=0.,
+                 drop_path_rate=0.2,
+                 norm_layer=nn.LayerNorm,
+                 patch_norm=True,
+                 out_indices=(0, 1)
+                 ):
+        super().__init__()
 
-img = torch.randn(2, 4, 512, 384)
+        self.pretrain_img_size = pretrain_img_size
 
-attn = AxialAttention(
-    dim = 4,               # embedding dimension
-    dim_index = 1,         # where is the embedding dimension
-    # dim_heads = 32,        # dimension of each head. defaults to dim // heads if not supplied
-    heads = 4,             # number of heads for multi-head attention
-    num_dimensions = 2,    # number of axial dimensions (images is 2, video is 3, or more)
-    sum_axial_out = True   # whether to sum the contributions of attention on each axis, or to run the input through them sequentially. defaults to true
-)
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_norm = patch_norm
+        self.out_indices = out_indices
 
-attn(img)
-transformer(conv1x1(img)) # (2, 128, 512, 384
-print(img.shape)
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+   
+        # build layers
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(
+                dim=int(embed_dim * 2 ** i_layer),
+                input_resolution=(
+                    pretrain_img_size[0] // patch_size[0] // 2 ** i_layer, pretrain_img_size[1] // patch_size[1] // 2 ** i_layer,
+                    pretrain_img_size[2] // patch_size[2] // 2 ** i_layer),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=window_size[i_layer],
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(
+                    depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=PatchMerging
+                # the last downsample is deleted(move in the bottle_neck)
+                # if (i_layer < self.num_layers - 1) else None
+                )
+            self.layers.append(layer)
+
+        num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
+        self.num_features = num_features
+
+        # add a norm layer for each output
+        for i_layer in out_indices:
+            layer = norm_layer(num_features[i_layer])
+            layer_name = f'norm{i_layer}'
+            self.add_module(layer_name, layer)
+
+
+    def forward(self, x):
+        """Forward function."""
+        
+        x = self.patch_embed(x)
+        down=[]
+       
+        Ws, Wh, Ww = x.size(2), x.size(3), x.size(4)
+        
+        x = x.flatten(2).transpose(1, 2).contiguous()
+        x = self.pos_drop(x)
+        
+      
+        for i in range(self.num_layers):
+            layer = self.layers[i]
+            x_out, S, H, W, x, Ws, Wh, Ww = layer(x, Ws, Wh, Ww)
+            if i in self.out_indices:
+                norm_layer = getattr(self, f'norm{i}')
+                x_out = norm_layer(x_out)
+
+                out = x_out.view(-1, S, H, W, self.num_features[i]).permute(0, 4, 1, 2, 3).contiguous()
+              
+                down.append(out)
+            if i == self.num_layers - 1:
+                down.append(x)
+        return down, Ws, Wh, Ww
+    
+class Decoder(nn.Module):
+    def __init__(self,
+                 pretrain_img_size,
+                 embed_dim,
+                 patch_size=4,
+                 depths=[2,2,2],
+                 num_heads=[24,12,6],
+                 window_size=4,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_rate=0.,
+                 attn_drop_rate=0.,
+                 drop_path_rate=0.2,
+                 norm_layer=nn.LayerNorm
+                 ):
+        super().__init__()
+        
+
+        self.num_layers = len(depths)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers)[::-1]:
+            
+            layer = BasicLayer_up(
+                dim=int(embed_dim * 2 ** (len(depths)-i_layer-1)),
+                input_resolution=(
+                    pretrain_img_size[0] // patch_size[0] // 2 ** (len(depths)-i_layer-1), pretrain_img_size[1] // patch_size[1] // 2 ** (len(depths)-i_layer-1),
+                    pretrain_img_size[2] // patch_size[2] // 2 ** (len(depths)-i_layer-1)),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=window_size[i_layer],
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(
+                    depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                upsample=Patch_Expanding
+                )
+            self.layers.append(layer)
+        self.num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
+    def forward(self,x,skips, S, H, W):
+            
+        outs=[]
+        #S, H, W = x.size(2), x.size(3), x.size(4)
+        # x = x.flatten(2).transpose(1, 2).contiguous()
+        for index,i in enumerate(skips):
+             i = i.flatten(2).transpose(1, 2).contiguous()
+             skips[index]=i
+        x = x.squeeze(1)
+            
+        for i in range(self.num_layers)[::-1]:
+            
+            layer = self.layers[i]
+            
+            x, S, H, W,  = layer(x,skips[i], S, H, W)
+            out = x.view(-1, S, H, W, self.num_features[i])
+            outs.append(out)
+        return outs
+
+      
+class final_patch_expanding(nn.Module):
+    # expand output of each split and merge them together
+    # input: list of all groups output at the layer
+    def __init__(self,dim,num_class,patch_size,group_num):
+        super().__init__()
+        self.group_num = group_num
+        for i in range(group_num):
+            setattr(self, f'up_{i}', nn.ConvTranspose3d(dim,num_class,patch_size,patch_size))
+        self.merge = nn.Conv3d(in_channels=group_num * num_class, out_channels=num_class, kernel_size=1, stride=1, padding=0)
+        self.up=nn.ConvTranspose3d(dim,num_class,patch_size,patch_size)
+        
+    def forward(self,x):
+        if len(x) == 1:
+            x = x[0]
+            x=x.permute(0,4,1,2,3).contiguous()
+            x=self.up(x)
+            return x
+        else:
+            expand_out = []
+            for i in range(self.group_num):
+                up = getattr(self, f'up_{i}')
+                x[i]=x[i].permute(0,4,1,2,3).contiguous()
+                x[i] = up(x[i])
+                expand_out.append(x[i])
+            expand_out_tensor = torch.cat(expand_out, dim=1)
+            merge_out = self.merge(expand_out_tensor)
+            return merge_out 
+        
+class nnFormer(SegmentationNetwork):
+
+    def __init__(self, crop_size=[64,128,128],
+                embedding_dim=192,
+                input_channels=1, 
+                num_classes=14, 
+                conv_op=nn.Conv3d, 
+                depths=[2,2,2,2],
+                num_heads=[6, 12, 24, 48],
+                patch_size=[2,4,4],
+                window_size=[4,4,8,4],
+                deep_supervision=True,
+                group_num=4,):
+      
+        super(nnFormer, self).__init__()
+        
+        
+        self.do_ds = deep_supervision
+        self.num_classes=num_classes
+        self.conv_op=conv_op
+        self.group_num=group_num
+        self.depth = len(depths) - 1
+        
+        self.upscale_logits_ops = []
+     
+        
+        self.upscale_logits_ops.append(lambda x: x)
+        # * Assume that the bottleneck is always 2 layers
+        embed_dim=embedding_dim
+        patch_size=patch_size
+        group_channel= int(input_channels / group_num)
+        
+        # * encoder
+        encoder_depths=depths[:len(depths)-2]
+        encoder_num_heads=num_heads[:len(num_heads)-2]
+        encoder_window_size=window_size[:len(window_size)-2]
+        
+        # * bottle neck 
+        bottle_neck_depths=depths[len(depths)-2:]
+        bottle_neck_num_heads=num_heads[len(num_heads)-2:]
+        bottle_neck_window_size=window_size[len(window_size)-2:]
+        
+        # * decoder 
+        decoder_depths=depths[::-1][2:]
+        decoder_num_heads=num_heads[::-1][:-2]
+        decoder_window_size=window_size[::-1][2:]
+        for i in range(self.group_num):
+            setattr(self, f'model_down{i}', Encoder(pretrain_img_size=crop_size,window_size=encoder_window_size,embed_dim=embed_dim,patch_size=patch_size,depths=encoder_depths,num_heads=encoder_num_heads,in_chans=group_channel))
+            setattr(self, f'decoder_{i}', Decoder(pretrain_img_size=crop_size,embed_dim=embed_dim,window_size=decoder_window_size,patch_size=patch_size,num_heads=decoder_num_heads,depths=decoder_depths))
+        # * as the last transformer in the bottleneck is been seperated from the encoder, the depth of the encoder - 2
+        # self.spatial_channel1 = SpatialAttention(input_channels, group_num)
+        self.bottle_neck = Bottleneck(
+            pretrain_img_size=crop_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            depths=bottle_neck_depths,
+            ori_depths=depths,
+            num_heads=bottle_neck_num_heads,
+            window_size=bottle_neck_window_size,
+        )
+        # * as the first transformer in the bottleneck is been seperated from the decoder, the depth of the decoder - 1
+        
+        self.encoder_merge = nn.Conv2d(in_channels=self.group_num, out_channels=1, kernel_size=1, stride=1, padding=0)
+        self.bottle_neck_split = nn.Conv2d(in_channels=1, out_channels=self.group_num, kernel_size=1, stride=1, padding=0)
+        self.decoder_merge = nn.Conv3d(in_channels=self.group_num * input_channels, out_channels= input_channels, kernel_size=1, stride=1, padding=0)
+        # every spatial attention needs a different input channel defined
+        # need sth. new
+        # in group convolution do we need to define different block for each group?
+        self.final=[]
+        if self.do_ds:
+            for i in range(len(depths)-1):
+                self.final.append(final_patch_expanding(embed_dim*2**i,num_classes,patch_size=patch_size, group_num=self.group_num))
+
+        else:
+            self.final.append(final_patch_expanding(embed_dim,num_classes,patch_size=patch_size, group_num=self.group_num))
+    
+        self.final=nn.ModuleList(self.final)
+    
+
+    def forward(self, x):
+
+        seg_outputs=[]
+        # group convolution
+        slice = int(x.shape[1] / self.group_num)
+        x_group_channel = [x[:,i * slice : (i + 1) * slice,:] for i in range(self.group_num)]
+        x_group_en_out = []
+        for i in range(len(x_group_channel)):
+            model_down = getattr(self, f'model_down{i}')
+            skips, Ws, Wh, Ww = model_down(x_group_channel[i])
+            x_group_en_out.append(skips)
+        # merge the final output of each group in encoder into one tensor and prepare for the skips
+        encoder_out_lst = []
+        encoder_skips = []
+        for i in range(self.group_num):
+            encoder_out_lst.append(x_group_en_out[i][-1].unsqueeze(1))
+            encoder_skips.append(x_group_en_out[i][:-1])
+        # using attention unit to fuse the feature maps of each group
+        # N group H W => N H W
+        encoder_out = torch.cat(encoder_out_lst, dim=1)
+        encoder_out = self.encoder_merge(encoder_out).squeeze(1)
+        bottle_neck_out_ds, bottle_neck_out, S, H, W = self.bottle_neck(encoder_out, Ws, Wh, Ww) 
+        # TODO: split the output of the bottleneck into N group
+        split_bottol_neck = self.bottle_neck_split(bottle_neck_out.unsqueeze(1))
+        split_out_channels = int(split_bottol_neck.shape[1] / self.group_num)
+        split_bottom_neck_out = [split_bottol_neck[:,i * split_out_channels : (i + 1) * split_out_channels,:] for i in range(self.group_num)]
+        
+        group_decoder_out = []
+        for i in range(self.group_num):
+            decoder = getattr(self, f'decoder_{i}')
+            group_split_out = decoder(split_bottom_neck_out[i], encoder_skips[i], S, H, W)
+            group_decoder_out.append(group_split_out)
+        # merge the output of each group in decoder into one tensor
+
+        if self.do_ds:
+            for i in range(len(group_decoder_out[0]) + 1):  
+                if i == 0:
+                    group_split_out = [bottle_neck_out_ds]
+                else:
+                    group_split_out = [group_decoder_out[j][i - 1] for j in range(self.group_num)]
+                seg_outputs.append(self.final[-(i+1)](group_split_out))
+            return seg_outputs[::-1]
+        else:
+            seg_outputs.append(group_decoder_out[0](group_split_out[-1]))
+        return seg_outputs[-1]        
 
