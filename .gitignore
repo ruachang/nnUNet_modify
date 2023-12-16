@@ -82,7 +82,8 @@ celerybeat-schedule
 venv/
 ENV/
 nnunet_test2/
-my_nnunet/
+my_nnunet/nnUNet_preprocessed/
+
 # Spyder project settings
 .spyderproject
 
@@ -111,6 +112,5 @@ my_nnunet/
 *.png
 *.jpg
 *.jpeg
-
+*.zip 
 *.model
-
