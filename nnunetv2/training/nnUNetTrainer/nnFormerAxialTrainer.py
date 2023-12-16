@@ -28,9 +28,6 @@ from nnunetv2.inference.export_prediction import export_prediction_from_logits, 
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
-# F:\dataset\mindBoggle\nnUNet\nnunetv2\training\nnUNetTrainer\variants\network_architecture\nnFormer_tumor.py
-# from varients.network_architecture.nnFormer_tumor import nnFormer
-from nnunetv2.training.nnUNetTrainer.variants.network_architecture.nnFormer_tumor_group import nnFormer
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
 from nnunetv2.training.data_augmentation.custom_transforms.cascade_transforms import MoveSegAsOneHotToData, \
     ApplyRandomBinaryOperatorTransform, RemoveRandomConnectedComponentFromOneHotEncodingTransform
