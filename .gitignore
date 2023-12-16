@@ -99,7 +99,6 @@ my_nnunet/nnUNet_preprocessed/
 .idea
 *.txt
 .idea/*
-*.png
 *.nii.gz
 *.nii
 *.tif
@@ -108,7 +107,6 @@ my_nnunet/nnUNet_preprocessed/
 *.xml
 *.pkl
 *.pdf
-*.png
 *.jpg
 *.jpeg
 *.zip 
