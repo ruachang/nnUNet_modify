@@ -1,0 +1,33 @@
+{
+    "all_results": {
+        "nnUNetTrainer__nnUNetPlans__3d_fullres": 0.7416861404494117
+    },
+    "best_model_or_ensemble": {
+        "postprocessing_file": "/workspace/nnUNet/my_nnunet/nnUNet_results/Dataset100_BrainTumour/nnUNetTrainer__nnUNetPlans__3d_fullres/crossval_results_folds_0_2_3_4/postprocessing.pkl",
+        "result_on_crossval_post_pp": 0.7416861404494117,
+        "result_on_crossval_pre_pp": 0.7416861404494117,
+        "selected_model_or_models": [
+            {
+                "configuration": "3d_fullres",
+                "plans_identifier": "nnUNetPlans",
+                "trainer": "nnUNetTrainer"
+            }
+        ],
+        "some_plans_file": "/workspace/nnUNet/my_nnunet/nnUNet_results/Dataset100_BrainTumour/nnUNetTrainer__nnUNetPlans__3d_fullres/crossval_results_folds_0_2_3_4/plans.json"
+    },
+    "considered_models": [
+        {
+            "configuration": "3d_fullres",
+            "plans": "nnUNetPlans",
+            "trainer": "nnUNetTrainer"
+        }
+    ],
+    "dataset_name_or_id": "Dataset100_BrainTumour",
+    "ensembling_allowed": true,
+    "folds": [
+        0,
+        2,
+        3,
+        4
+    ]
+}
