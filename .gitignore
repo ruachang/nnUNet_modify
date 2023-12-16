@@ -91,7 +91,6 @@ my_nnunet/nnUNet_preprocessed/
 .ropeproject
 
 *.memmap
-*.png
 *.zip
 *.npz
 *.npy
